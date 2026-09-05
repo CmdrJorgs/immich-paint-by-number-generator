@@ -103,3 +103,58 @@ def test_legend_and_reference_flags_reach_the_pdf(tmp_path, photo_like):
          "--no-reference", "-o", str(output)]
     ) == 0
     assert len(pypdfium2.PdfDocument(str(output))) == 1
+
+
+# ------------------------------------------------------------------- styles
+
+
+@pytest.mark.parametrize("style", ["contour", "square", "triangle", "hex"])
+def test_every_style_is_reachable_from_the_command_line(style, tmp_path, photo_like):
+    source = tmp_path / "photo.png"
+    photo_like.save(source)
+    output = tmp_path / f"{style}.pdf"
+    assert main(
+        ["--from-file", str(source), "--style", style, "-c", "8", "-r", "320",
+         "-o", str(output)]
+    ) == 0
+    assert output.exists() and output.stat().st_size > 1000
+
+
+def test_an_unknown_style_is_rejected_by_the_parser():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["generate", "--style", "pentagon"])
+
+
+def test_cell_size_defaults_per_style():
+    from immich_pbn.pbn.tessellation import build_tessellation
+
+    # Not one shared number: an 8 mm triangle has half the room of an 8 mm square.
+    assert build_tessellation("triangle").default_cell_mm > build_tessellation("square").default_cell_mm
+
+
+def test_min_region_mm_on_a_tiled_page_says_it_does_nothing(tmp_path, photo_like, capsys):
+    source = tmp_path / "photo.png"
+    photo_like.save(source)
+    assert main(
+        ["--from-file", str(source), "--style", "square", "--min-region-mm", "5",
+         "-c", "6", "-r", "320", "-o", str(tmp_path / "o.pdf")]
+    ) == 0
+    assert "--min-region-mm applies only to --style contour" in capsys.readouterr().err
+
+
+def test_cell_mm_on_a_contour_page_says_it_does_nothing(tmp_path, photo_like, capsys):
+    source = tmp_path / "photo.png"
+    photo_like.save(source)
+    assert main(
+        ["--from-file", str(source), "--cell-mm", "12", "-c", "6", "-r", "320",
+         "-o", str(tmp_path / "o.pdf")]
+    ) == 0
+    assert "--cell-mm applies only to a tiled style" in capsys.readouterr().err
+
+
+def test_a_tiled_page_reports_cells_rather_than_regions(tmp_path, photo_like, capsys):
+    source = tmp_path / "photo.png"
+    photo_like.save(source)
+    main(["--from-file", str(source), "--style", "hex", "-c", "6", "-r", "320",
+          "-o", str(tmp_path / "o.pdf")])
+    assert "cells" in capsys.readouterr().out

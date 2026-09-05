@@ -199,3 +199,111 @@ def test_preview_png_is_written(photo_bytes, tmp_path):
     path = tmp_path / "preview.png"
     save_preview_png(result, str(path))
     assert Image.open(path).size == result.working_size
+
+
+# ------------------------------------------------------------- tiled styles
+
+TILED = ("square", "triangle", "hex")
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_every_tiled_style_produces_a_page(style, photo_bytes):
+    result = generate(photo_bytes, _options(style=style, cell_mm=10.0), _layout())
+    assert result.stats["style"] == style
+    assert result.stats["regions"] > 10
+    assert result.outline.any()
+    assert len(result.placements) == result.stats["regions"]
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_the_outline_is_drawn_from_the_same_lattice_that_was_coloured(style, photo_bytes):
+    """The invariant a tiled page stands on.
+
+    The colours and numbers come from the lattice evaluated on the working
+    raster; the edges come from it evaluated on the print raster. If the two
+    disagree, the page grows cells that are outlined but never coloured or
+    numbered -- which is exactly what a half-height row along the bottom edge
+    looked like before the counts were pinned to the page's millimetres.
+    """
+    for cell_mm in (5.0, 8.0, 11.0, 14.3):
+        result = generate(photo_bytes, _options(style=style, cell_mm=cell_mm), _layout())
+        assert result.stats["outline_cells"] == result.stats["regions"], (
+            f"{style} at {cell_mm}mm: {result.stats['outline_cells']} cells outlined "
+            f"but {result.stats['regions']} coloured"
+        )
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_a_tiled_page_merges_nothing(style, photo_bytes):
+    # A mosaic's whole point is the visible grid; absorbing a cell into its
+    # same-coloured neighbour would grow back the organic blobs it avoids.
+    result = generate(photo_bytes, _options(style=style), _layout())
+    assert result.regions.merge_passes == 0
+    labels = result.regions.labels
+    assert result.stats["regions"] == np.unique(labels).size
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_every_cell_gets_a_colour_from_the_palette(style, photo_bytes):
+    result = generate(photo_bytes, _options(style=style), _layout())
+    used = np.unique(result.regions.indices)
+    assert used.min() >= 0
+    assert used.max() < len(result.palette)
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_the_cell_size_is_snapped_and_reported(style, photo_bytes):
+    result = generate(photo_bytes, _options(style=style, cell_mm=8.0), _layout())
+    reported = result.stats["cell_mm"]
+    # Snapped to a whole number of cells across, so never exactly what was asked.
+    assert abs(reported - 8.0) < 1.0
+    assert result.drawing_size_mm[0] / reported == pytest.approx(
+        round(result.drawing_size_mm[0] / reported), abs=0.02
+    )
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_smaller_cells_mean_more_of_them(style, photo_bytes):
+    coarse = generate(photo_bytes, _options(style=style, cell_mm=16.0), _layout())
+    fine = generate(photo_bytes, _options(style=style, cell_mm=6.0), _layout())
+    assert fine.stats["regions"] > coarse.stats["regions"] * 3
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_digits_grow_with_the_room_a_cell_actually_has(style, photo_bytes):
+    small = generate(photo_bytes, _options(style=style, cell_mm=8.0), _layout())
+    large = generate(photo_bytes, _options(style=style, cell_mm=22.0), _layout())
+    assert large.number_size_mm > small.number_size_mm
+    # Sized off the inscribed circle, not the nominal cell.
+    assert large.number_size_mm <= large.stats["inradius_mm"] * 1.5
+
+
+def test_a_triangle_cell_has_less_room_than_a_square_of_the_same_size(photo_bytes):
+    square = generate(photo_bytes, _options(style="square", cell_mm=14.0), _layout())
+    triangle = generate(photo_bytes, _options(style="triangle", cell_mm=14.0), _layout())
+    assert triangle.stats["inradius_mm"] < square.stats["inradius_mm"]
+
+
+def test_contour_remains_the_default(photo_bytes):
+    assert generate(photo_bytes, _options(), _layout()).stats["style"] == "contour"
+
+
+def test_an_unknown_style_is_rejected(photo_bytes):
+    from immich_pbn.pbn.tessellation import TessellationError
+
+    with pytest.raises(TessellationError, match="hex"):
+        generate(photo_bytes, _options(style="pentagon"), _layout())
+
+
+@pytest.mark.parametrize("style", TILED)
+def test_a_tiled_page_still_renders_to_a4(style, photo_bytes, tmp_path):
+    pypdfium2 = pytest.importorskip("pypdfium2")
+    result = generate(photo_bytes, _options(style=style), _layout())
+    path = tmp_path / f"{style}.pdf"
+    with path.open("wb") as handle:
+        stats = render_pdf(result, RenderOptions(legend="inline"), handle)
+    document = pypdfium2.PdfDocument(str(path))
+    width, height = document[0].get_size()
+    assert sorted((round(width), round(height))) == [595, 842]
+    # Numbers are what makes it paintable; a tiled page should number nearly all.
+    assert stats["numbered"] > 0.95 * result.stats["regions"]

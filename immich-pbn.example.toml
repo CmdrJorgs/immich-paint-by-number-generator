@@ -57,4 +57,10 @@ hosts = { "photos.example.com" = "203.0.113.10" }
 # ------------------------------------------------------------------- defaults
 # Reserved for per-invocation defaults. The CLI is the source of truth for
 # option names, so nothing is read from here yet.
+#
+# For reference, the drawing options are:
+#   --style     contour (follow the photo's colour fields) | square | triangle | hex
+#   --colours   paints in the palette (default 20)
+#   --cell-mm   tiled styles only; defaults per style, since an 8 mm triangle
+#               has half the room of an 8 mm square
 [defaults]

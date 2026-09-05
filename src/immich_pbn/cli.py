@@ -20,8 +20,9 @@ from .immich.models import Asset
 from .net.resolver import ResolverError, available_resolvers
 from .net.transport import TransportError
 from .pbn.page import PageLayout, legend_height_for
-from .pbn.pipeline import PbnOptions, PipelineError, generate
+from .pbn.pipeline import CONTOUR_STYLE, PbnOptions, PipelineError, generate
 from .pbn.render import RenderOptions, render_pdf, save_preview_png
+from .pbn.tessellation import available_tessellations, build_tessellation
 
 log = logging.getLogger("immich_pbn")
 
@@ -105,8 +106,30 @@ def build_parser() -> argparse.ArgumentParser:
                           "never upscales past the source (default: 1400)")
     art.add_argument("--dpi", type=int, default=300,
                      help="print density for the outline raster (default: 300)")
-    art.add_argument("--min-region-mm", type=float, default=3.0, metavar="MM",
-                     help="dissolve anything narrower than this on paper (default: 3.0)")
+    art.add_argument(
+        "--style", choices=(CONTOUR_STYLE, *available_tessellations()),
+        default=CONTOUR_STYLE,
+        help=(
+            "contour follows the photo's own colour fields (default); the "
+            "others impose a lattice and give each cell one average colour: "
+            + "; ".join(
+                f"{n} = {build_tessellation(n).summary}" for n in available_tessellations()
+            )
+        ),
+    )
+    art.add_argument(
+        "--cell-mm", type=float, default=None, metavar="MM",
+        help=(
+            "cell size for a tiled style, in printed mm (defaults per style: "
+            + ", ".join(
+                f"{n} {build_tessellation(n).default_cell_mm:g}"
+                for n in available_tessellations()
+            )
+            + ")"
+        ),
+    )
+    art.add_argument("--min-region-mm", type=float, default=None, metavar="MM",
+                     help="contour only: dissolve anything narrower than this (default: 3.0)")
     art.add_argument("--line-width-mm", type=float, default=0.28, metavar="MM")
     art.add_argument("--smoothing", type=int, default=2, metavar="R",
                      help="pre-quantization median radius; 0 disables (default: 2)")
@@ -246,12 +269,32 @@ def cmd_generate(args, profile: ServerProfile, config: Config) -> int:
             Path(args.save_source).write_bytes(source)
             print(f"wrote {args.save_source}")
 
+    tiled = args.style != CONTOUR_STYLE
+    if tiled and args.min_region_mm is not None:
+        print(
+            "note: --min-region-mm applies only to --style contour; a tiled page "
+            "has uniform cells, so nothing needs dissolving.",
+            file=sys.stderr,
+        )
+    if not tiled and args.cell_mm is not None:
+        print(
+            "note: --cell-mm applies only to a tiled style; contour takes its "
+            "shapes from the photograph.",
+            file=sys.stderr,
+        )
+
     options = PbnOptions(
         colours=args.colours,
         resolution=args.resolution,
         dpi=args.dpi,
         seed=args.seed,
-        min_region_mm=args.min_region_mm,
+        style=args.style,
+        cell_mm=(
+            args.cell_mm
+            if args.cell_mm is not None
+            else (build_tessellation(args.style).default_cell_mm if tiled else 8.0)
+        ),
+        min_region_mm=args.min_region_mm if args.min_region_mm is not None else 3.0,
         smoothing=args.smoothing,
         line_width_mm=args.line_width_mm,
         number_size_mm=args.number_size_mm,
@@ -269,6 +312,8 @@ def cmd_generate(args, profile: ServerProfile, config: Config) -> int:
     result = generate(source, options, layout)
 
     caption = f"{caption_source} - {len(result.palette)} colours"
+    if tiled:
+        caption += f" - {args.style} cells of {result.stats['cell_mm']}mm"
     if asset is not None and asset.local_date_time:
         caption += f" - {asset.local_date_time[:10]}"
     render_options = RenderOptions(
@@ -276,7 +321,7 @@ def cmd_generate(args, profile: ServerProfile, config: Config) -> int:
         caption=caption,
         legend=args.legend,
         reference_page=not args.no_reference,
-        number_size_mm=args.number_size_mm,
+        number_size_mm=result.number_size_mm,
         show_hex=not args.no_hex,
     )
     with open(args.output, "wb") as handle:
@@ -378,16 +423,21 @@ def _report_filters(albums, people, favorites: bool) -> None:
 
 def _report_result(result, drawn: dict[str, int], output: str) -> None:
     total = drawn["numbered"] + drawn["unnumbered"]
+    unit = "cells" if result.stats["style"] != CONTOUR_STYLE else "regions"
     print(
-        f"wrote {output}: {result.stats['regions']} regions, "
+        f"wrote {output}: {result.stats['regions']} {unit}, "
         f"{result.stats['colours_used']} colours, "
         f"{drawn['numbered']}/{total} numbered"
     )
     if drawn["unnumbered"]:
+        remedy = (
+            "Raise --cell-mm to enlarge them."
+            if result.stats["style"] != CONTOUR_STYLE
+            else "Raise --min-region-mm to dissolve them."
+        )
         print(
-            f"  {drawn['unnumbered']} region(s) were too narrow for a number "
-            f"-- {drawn['unnumbered_area_percent']}% of the painted area. "
-            f"Raise --min-region-mm to dissolve them."
+            f"  {drawn['unnumbered']} {unit[:-1]}(s) were too narrow for a number "
+            f"-- {drawn['unnumbered_area_percent']}% of the painted area. {remedy}"
         )
     if result.stats.get("resolution_capped"):
         print(

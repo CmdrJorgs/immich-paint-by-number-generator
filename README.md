@@ -5,8 +5,13 @@ people in it, or by whether you starred it — and turns it into a printable A4
 paint-by-number page: outlined regions, a number in each one, and a colour key
 with the sRGB hex of every paint.
 
+The page can follow the photo's own colour fields, or ignore them entirely and
+impose a lattice — squares for a pixel mosaic, triangles for the low-poly look,
+hexagons for something in between.
+
 ```
 immich-pbn --album "Iceland 2024" --colours 20 -o iceland.pdf
+immich-pbn --album "Iceland 2024" --style hex -o iceland-mosaic.pdf
 ```
 
 ```
@@ -74,9 +79,11 @@ settings without hammering your server.
 
 | Flag | Default | What it changes |
 | --- | --- | --- |
+| `--style` | contour | `contour`, `square`, `triangle` or `hex` (see below) |
 | `--colours N` | 20 | Paints in the palette, and roughly how many regions |
 | `--resolution PX` | 1400 | Working long edge — fidelity, not detail (see below) |
-| `--min-region-mm MM` | 3.0 | Narrowest shape allowed to survive, in printed mm |
+| `--cell-mm MM` | per style | Tiled styles only: cell size in printed mm |
+| `--min-region-mm MM` | 3.0 | Contour only: narrowest shape allowed to survive |
 | `--dpi N` | 300 | Print density of the outline raster |
 | `--line-width-mm MM` | 0.28 | Outline weight |
 | `--smoothing R` | 2 | Noise removal before quantization; 0 disables |
@@ -102,6 +109,63 @@ and does not drift when you change resolution.
 It also only ever downscales. Set it above the photo's own long edge and it
 does nothing; the tool says so rather than pretending.
 
+## Styles
+
+`contour` traces the photo's own colour fields, so a region is a shadow or a
+petal with an outline of whatever shape that turned out to be. The three tiled
+styles do the opposite: they lay a fixed lattice over the picture and give each
+cell the average colour of what falls inside it. Same photo, same palette, very
+different thing to paint.
+
+On one still life at 20 colours:
+
+| Style | Cell | Cells | Numbered | Feel |
+| --- | --- | --- | --- | --- |
+| `contour` | — | 174 regions | 67% | Follows the picture |
+| `square` | 8.1 mm | 506 | 100% | Pixel mosaic |
+| `triangle` | 14.3 mm | 378 | 100% | Low-poly |
+| `hex` | 8.9 mm | 495 | 99% | Honeycomb |
+
+Three things fall out of that table.
+
+**Tiled pages number nearly every cell**, where a contour page numbers about
+two thirds of its regions. Nothing is wrong with the contour page — its
+unnumbered third is slivers totalling a few percent of the painted area — but a
+lattice has no slivers to begin with, so every cell has room for its digit.
+
+**Cells snap to fit.** Ask for 8 mm and you get 8.09 mm, because a whole number
+of cells has to span the width. Left ragged, the right-hand edge is a quarter of
+a square hanging off the frame with no room for its number, which reads as a
+printing mistake rather than a design. Whatever still does not divide evenly is
+split between both edges instead of piling up on the right and bottom.
+
+**The default cell size is per style, and so is the digit size.** An 8 mm
+triangle has barely half the elbow room of an 8 mm square — the inscribed circle
+is 0.29 of the side against 0.5 — so triangles default to 14 mm and digits are
+sized off the inscribed circle rather than the nominal cell. One shared number
+would work for one shape and crowd another.
+
+`--min-region-mm` does nothing on a tiled page and `--cell-mm` does nothing on a
+contour one; passing either to the wrong style says so rather than ignoring you.
+
+### Why the lattice is evaluated twice
+
+Each tiling is a pure function of position, so it is asked for the grid twice
+per page: once at working resolution to choose colours and place numbers, once
+at print resolution to draw the edges. The edges are then the true geometry
+rather than an enlarged copy of a small drawing.
+
+That only works if the two evaluations agree exactly, and getting there was the
+whole difficulty. The two rasters are the same rectangle in different pixel
+counts, so their aspect ratios disagree in the fourth decimal place. Round a row
+count out of each independently and a page whose ideal answer is 34.5 rows gets
+34 from one and 35 from the other — and prints a half-height row of cells along
+the bottom edge, outlined, with no number in any of them. The fix is to derive
+the counts from the page's millimetres, which is what the page actually *is*,
+and clamp every lattice index into them. No tolerance to tune and no knife-edge
+to land on. A test sweeps page shapes against cell sizes asserting the two
+lattices come back identical.
+
 ## How the page is made
 
 1. **Decode** once, honour EXIF rotation, downscale to the working resolution.
@@ -115,13 +179,20 @@ does nothing; the tool says so rather than pretending.
    lost white from the picture entirely. Colours closer than 2.5 ΔE are then
    merged — below the just-noticeable difference they are the same paint, and
    only waste a legend slot.
-4. **Region-build and merge.** Quantization alone gives a posterised photo whose
-   "regions" include ten thousand two-pixel specks along every edge. Anything
-   below the paintable minimum is absorbed into whichever neighbour it shares
-   the most border with, nudged towards neighbours of a similar colour so a
-   dark eyelash is not swallowed by a bright cheek. Absorption changes colours,
-   which can merge further regions, so it runs to a fixed point. On a test
-   image this took 44,672 raw regions down to 110.
+4. **Region-build.** On a contour page: quantization alone gives a posterised
+   photo whose "regions" include ten thousand two-pixel specks along every
+   edge. Anything below the paintable minimum is absorbed into whichever
+   neighbour it shares the most border with, nudged towards neighbours of a
+   similar colour so a dark eyelash is not swallowed by a bright cheek.
+   Absorption changes colours, which can merge further regions, so it runs to a
+   fixed point. On a test image this took 44,672 raw regions down to 110.
+
+   On a tiled page the cells *are* the regions, and nothing is merged — that is
+   the point rather than an omission. A mosaic's whole appeal is the visible
+   grid, and absorbing a cell into its same-coloured neighbour would grow back
+   exactly the organic blobs the tiled styles exist to avoid. Cells are also
+   clustered directly, rather than pixels being clustered and then voted on, so
+   the palette is chosen to represent the things that will actually be painted.
 5. **Place the numbers** at each region's pole of inaccessibility — the centre
    of the largest circle that fits inside it. The centroid is the obvious
    answer and the wrong one: on both a crescent and an L-shape it lands outside
@@ -198,11 +269,14 @@ pip install -e ".[dev]"
 pytest
 ```
 
-115 tests. The interesting ones pin behaviour that is easy to get quietly
+189 tests. The interesting ones pin behaviour that is easy to get quietly
 wrong: that the number lands inside a crescent where the centroid does not,
-that the resolver redirects a live connection without breaking TLS identity,
-that a mid-olive swatch gets black digits rather than unreadable white ones,
-and that every response shape Immich has ever returned still parses.
+that the lattice drawn at print resolution is the same one that was coloured at
+working resolution, that a triangle cell really is equilateral and not a
+bisected square, that the resolver redirects a live connection without breaking
+TLS identity, that a mid-olive swatch gets black digits rather than unreadable
+white ones, and that every response shape Immich has ever returned still
+parses.
 
 ## Known limitations
 
@@ -211,10 +285,16 @@ and that every response shape Immich has ever returned still parses.
   the client is covered by tests using recorded response shapes — but no real
   server was available while writing this. `immich-pbn doctor` exists to make
   the first contact diagnosable rather than mysterious.
-- The label map is upscaled to print resolution with nearest-neighbour, so
-  region boundaries carry a small stair-step. At 300 dpi with a 1400 px working
-  image the steps are about 0.2 mm, under the outline's own weight. Raise
-  `--resolution` toward the print pixel width if it ever shows.
+- On a **contour** page the label map is upscaled to print resolution with
+  nearest-neighbour, so region boundaries carry a small stair-step. At 300 dpi
+  with a 1400 px working image the steps are about 0.2 mm, under the outline's
+  own weight. Raise `--resolution` toward the print pixel width if it ever
+  shows. Tiled styles do not have this: their edges are re-derived at print
+  resolution from the geometry itself.
+- A hexagon lattice cannot meet a rectangle cleanly — alternate rows end in half
+  cells at the left and right edges. That is what a hex grid in a frame looks
+  like rather than a defect, but it does mean a handful of edge cells are
+  smaller than the rest.
 - A4 only. The page geometry is in millimetres throughout and `PageLayout`
   takes its size from two constants, so US Letter is a small change, not a
   rewrite — but it is not wired to a flag today.

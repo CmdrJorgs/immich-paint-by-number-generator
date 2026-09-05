@@ -32,21 +32,30 @@ _COLOUR_SCALE = 15.0
 
 @dataclass
 class RegionMap:
-    """Final regions, one integer label per pixel, labels numbered from 1."""
+    """Final regions, one integer label per pixel, labels numbered from 1.
+
+    Labels need not be contiguous. Connected-component labelling produces a
+    dense run, but a geometric tiling derives each cell's id from lattice
+    arithmetic, so ids outside the picture simply never appear. Everything here
+    is therefore driven by which ids actually have pixels rather than by the
+    highest id present -- assuming density would silently number the wrong
+    regions on a tiled page.
+    """
 
     labels: np.ndarray  # (H, W) int32
-    colour_of_region: np.ndarray  # (n_regions + 1,) int16, index 0 unused
-    areas: np.ndarray  # (n_regions + 1,) int64
+    colour_of_region: np.ndarray  # (max_label + 1,) int16, index 0 unused
+    areas: np.ndarray  # (max_label + 1,) int64
     indices: np.ndarray  # (H, W) int16 palette index per pixel
     merge_passes: int = 0
 
     @property
     def count(self) -> int:
-        return int(self.labels.max())
+        """How many regions actually carry pixels."""
+        return int(np.count_nonzero(self.areas[1:]))
 
     @property
     def region_ids(self) -> np.ndarray:
-        return np.arange(1, self.count + 1)
+        return np.flatnonzero(self.areas[1:]) + 1
 
     def boundary_mask(self, *, include_frame: bool = True) -> np.ndarray:
         """Pixels that sit on the edge between two regions."""

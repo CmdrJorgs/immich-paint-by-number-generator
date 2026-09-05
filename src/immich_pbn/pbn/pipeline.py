@@ -14,8 +14,9 @@ from scipy import ndimage
 from .colour import rgb_bytes_to_lab
 from .numbering import NumberPlacement, place_numbers
 from .page import PageLayout, mm_to_pixels
-from .quantize import DEFAULT_MIN_SEPARATION, Palette, quantize
+from .quantize import DEFAULT_MIN_SEPARATION, Palette, quantize, quantize_cells
 from .regions import RegionMap, area_for_min_width, build_regions
+from .tessellation import Tessellation, build_tessellation
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +28,19 @@ class PipelineError(RuntimeError):
     pass
 
 
+#: "contour" traces the picture's own colour fields. The rest impose a lattice
+#: on it and let each cell take the average colour underneath.
+CONTOUR_STYLE = "contour"
+
+
 @dataclass
 class PbnOptions:
     colours: int = 20
+    #: "contour", or any name from the tessellation registry.
+    style: str = CONTOUR_STYLE
+    #: Cell size for a tiled style, in printed millimetres. Ignored by
+    #: "contour", which takes its shapes from the photograph instead.
+    cell_mm: float = 8.0
     #: Long edge of the working image in pixels -- the fidelity dial.
     #:
     #: Counter-intuitively, raising it yields *fewer* regions, not more
@@ -74,6 +85,10 @@ class PbnResult:
     drawing_size_mm: tuple[float, float]
     working_size: tuple[int, int]
     source_size: tuple[int, int]
+    #: Digit height actually to be used, in mm. On a tiled page this grows with
+    #: the cell: 2.6 mm digits look right in an 8 mm square and ridiculous in a
+    #: 20 mm one, and the cell size is the only thing that knows which it is.
+    number_size_mm: float = 2.6
     stats: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -143,39 +158,55 @@ def generate(
 
     smoothed = _smooth(image, options.smoothing)
     rgb = np.asarray(smoothed, dtype=np.uint8)
-
-    log.debug("quantizing %sx%s to %s colours", image.width, image.height, options.colours)
-    indices, palette = quantize(
-        rgb_bytes_to_lab(rgb),
-        options.colours,
-        seed=options.seed,
-        min_separation=options.min_colour_separation,
-    )
-    if len(palette) < 2:
-        raise PipelineError(
-            "this photo reduces to a single colour -- there is nothing to paint. "
-            "Try a different image, or raise --colours if you lowered it."
-        )
-
-    min_area = area_for_min_width(options.min_region_mm, drawing_w_mm, image.width)
-    regions = build_regions(indices, palette.lab, min_area=min_area)
-    placements = place_numbers(regions)
+    lab = rgb_bytes_to_lab(rgb)
 
     out_w = mm_to_pixels(drawing_w_mm, options.dpi)
     out_h = mm_to_pixels(drawing_h_mm, options.dpi)
-    outline = _render_outline(regions.labels, (out_w, out_h), options, drawing_w_mm)
+
+    if options.style == CONTOUR_STYLE:
+        regions, palette, extra = _contour_regions(lab, image, options, drawing_w_mm)
+        outline_labels = _upscale_labels(regions.labels, (out_w, out_h))
+    else:
+        tiling = build_tessellation(options.style)
+        cell_fraction = tiling.snap(options.cell_mm / drawing_w_mm)
+        # The page's true aspect, in millimetres, handed to both evaluations.
+        # Letting each infer it from its own pixel dimensions is what puts an
+        # unnumbered row of cells along the bottom edge -- see Tessellation.counts.
+        aspect = drawing_h_mm / drawing_w_mm
+        regions, palette, extra = _tiled_regions(
+            lab, tiling, cell_fraction, aspect, options
+        )
+        extra["cell_mm"] = round(cell_fraction * drawing_w_mm, 2)
+        extra["inradius_mm"] = round(
+            extra["cell_mm"] * tiling.inradius_factor, 2
+        )
+        # Re-evaluated rather than enlarged: the tiling is a pure function of
+        # position, so asking it for the print grid directly gives exact edges
+        # instead of a magnified copy of the small one.
+        outline_labels = tiling.cell_map(out_w, out_h, cell_fraction, aspect)
+        # The invariant the tiled styles stand on: the lattice the edges are
+        # drawn from must be the same lattice the colours and numbers came
+        # from, or the page grows cells that are outlined but never coloured.
+        # Pinning the counts to the page's millimetres gets this right to
+        # within a couple of corner pixels, which this makes exact.
+        outline_labels = _fold_strays(outline_labels, regions.region_ids)
+        extra["outline_cells"] = int(np.unique(outline_labels).size)
+
+    placements = place_numbers(regions)
+    outline = _edges_from_labels(outline_labels, options, drawing_w_mm)
 
     preview_rgb = palette.rgb[np.clip(regions.indices, 0, len(palette) - 1)]
 
     used = np.unique(regions.indices)
     stats = {
+        "style": options.style,
         "regions": regions.count,
         "merge_passes": regions.merge_passes,
         "colours_used": int(used.size),
-        "min_region_px": min_area,
         "outline_pixels": int(outline.sum()),
         "resolution_capped": bool(max(source_size) < options.resolution),
     }
+    stats.update(extra)
     return PbnResult(
         palette=palette,
         regions=regions,
@@ -186,8 +217,77 @@ def generate(
         drawing_size_mm=(drawing_w_mm, drawing_h_mm),
         working_size=(image.width, image.height),
         source_size=source_size,
+        # Scaled off the inscribed radius rather than the nominal cell size:
+        # a 14 mm triangle and a 14 mm square are not remotely the same amount
+        # of room for a digit, and the circle that fits inside is what decides.
+        number_size_mm=max(
+            options.number_size_mm, 0.62 * float(stats.get("inradius_mm", 0.0))
+        ),
         stats=stats,
     )
+
+
+def _contour_regions(
+    lab: np.ndarray,
+    image: Image.Image,
+    options: PbnOptions,
+    drawing_w_mm: float,
+) -> tuple[RegionMap, Palette, dict[str, Any]]:
+    """The original route: cluster pixels, trace colour fields, dissolve specks."""
+    log.debug("quantizing %sx%s to %s colours", image.width, image.height, options.colours)
+    indices, palette = quantize(
+        lab,
+        options.colours,
+        seed=options.seed,
+        min_separation=options.min_colour_separation,
+    )
+    if len(palette) < 2:
+        raise PipelineError(
+            "this photo reduces to a single colour -- there is nothing to paint. "
+            "Try a different image, or raise --colours if you lowered it."
+        )
+    min_area = area_for_min_width(options.min_region_mm, drawing_w_mm, image.width)
+    regions = build_regions(indices, palette.lab, min_area=min_area)
+    return regions, palette, {"min_region_px": min_area}
+
+
+def _tiled_regions(
+    lab: np.ndarray,
+    tiling: Tessellation,
+    cell_fraction: float,
+    aspect: float,
+    options: PbnOptions,
+) -> tuple[RegionMap, Palette, dict[str, Any]]:
+    """A lattice route: fixed cells, each painted its own average colour.
+
+    No merging happens here, and that is the point rather than an omission. A
+    mosaic's whole appeal is the visible grid; absorbing a cell into its
+    same-coloured neighbour would grow exactly the organic blobs the tiled
+    styles exist to avoid. Every cell stays its own region and gets its own
+    number, even when four in a row share a paint.
+    """
+    height, width = lab.shape[:2]
+    cells = tiling.cell_map(width, height, cell_fraction, aspect)
+    colour_of_cell, per_pixel, palette = quantize_cells(
+        lab,
+        cells,
+        options.colours,
+        seed=options.seed,
+        min_separation=options.min_colour_separation,
+    )
+    if len(palette) < 2:
+        raise PipelineError(
+            "this photo reduces to a single colour -- there is nothing to paint. "
+            "Try a different image, or raise --colours if you lowered it."
+        )
+    areas = np.bincount(cells.ravel(), minlength=colour_of_cell.size).astype(np.int64)
+    regions = RegionMap(
+        labels=cells,
+        colour_of_region=colour_of_cell,
+        areas=areas,
+        indices=per_pixel,
+    )
+    return regions, palette, {}
 
 
 def _smooth(image: Image.Image, radius: int) -> Image.Image:
@@ -205,13 +305,26 @@ def _smooth(image: Image.Image, radius: int) -> Image.Image:
     return out.filter(ImageFilter.GaussianBlur(radius=0.5))
 
 
-def _render_outline(
-    labels: np.ndarray,
-    output_size: tuple[int, int],
-    options: PbnOptions,
-    drawing_width_mm: float,
-) -> np.ndarray:
-    """Upscale the label map to print size and draw its edges at a printable weight.
+def _fold_strays(labels: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """Absorb any cell the colour pass never saw into its nearest real neighbour.
+
+    A cell can exist in the print raster and not the working one when it is
+    only a pixel or two across -- the corners of a sheared triangle lattice do
+    this. Such a cell is smaller than the frame line drawn over it, so nobody
+    would ever see it, but leaving it in means the page contains an outlined
+    region with no colour and no number, and "nobody would see it" is a much
+    weaker guarantee than "it is not there".
+    """
+    stray = ~np.isin(labels, known)
+    if not stray.any():
+        return labels
+    # Indices of the nearest non-stray pixel, which is the cell to join.
+    _, (rows, columns) = ndimage.distance_transform_edt(stray, return_indices=True)
+    return labels[rows, columns]
+
+
+def _upscale_labels(labels: np.ndarray, output_size: tuple[int, int]) -> np.ndarray:
+    """Nearest-neighbour, so boundaries stay boundaries.
 
     Upscaling the *labels* rather than an already-drawn outline is what keeps
     the lines crisp: a line drawn small and then enlarged is a blurry, uneven
@@ -219,16 +332,25 @@ def _render_outline(
     wide at the target density before it is deliberately thickened.
     """
     out_w, out_h = output_size
-    scaled = np.asarray(
+    return np.asarray(
         Image.fromarray(labels.astype(np.int32), mode="I").resize(
             (out_w, out_h), Image.NEAREST
         ),
         dtype=np.int32,
     )
 
-    edge = np.zeros(scaled.shape, dtype=bool)
-    edge[:, :-1] |= scaled[:, :-1] != scaled[:, 1:]
-    edge[:-1, :] |= scaled[:-1, :] != scaled[1:, :]
+
+def _edges_from_labels(
+    labels: np.ndarray,
+    options: PbnOptions,
+    drawing_width_mm: float,
+) -> np.ndarray:
+    """Draw the boundaries of a label map at a printable line weight."""
+    out_h, out_w = labels.shape
+
+    edge = np.zeros(labels.shape, dtype=bool)
+    edge[:, :-1] |= labels[:, :-1] != labels[:, 1:]
+    edge[:-1, :] |= labels[:-1, :] != labels[1:, :]
 
     target_px = options.line_width_mm / drawing_width_mm * out_w
     extra = int(round((target_px - 1.0) / 2.0))

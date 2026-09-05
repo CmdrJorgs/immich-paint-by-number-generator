@@ -69,10 +69,44 @@ def quantize(
 
     Returns the per-pixel palette index and the palette itself.
     """
+    height, width = lab_image.shape[:2]
+    indices, palette = quantize_points(
+        lab_image.reshape(-1, 3),
+        k,
+        seed=seed,
+        sample_size=sample_size,
+        max_iter=max_iter,
+        tolerance=tolerance,
+        min_separation=min_separation,
+        restarts=restarts,
+    )
+    return indices.reshape(height, width), palette
+
+
+def quantize_points(
+    points: np.ndarray,
+    k: int,
+    *,
+    seed: int | None = None,
+    sample_size: int = DEFAULT_SAMPLE,
+    max_iter: int = 60,
+    tolerance: float = 0.02,
+    min_separation: float = DEFAULT_MIN_SEPARATION,
+    restarts: int = DEFAULT_RESTARTS,
+) -> tuple[np.ndarray, Palette]:
+    """Cluster an (N, 3) cloud of Lab colours into ``k`` paints.
+
+    The unit of clustering is deliberately a parameter of the caller rather
+    than baked in: for a traced page the points are pixels, and for a tiled one
+    they are the mean colour of each cell. Clustering the cells directly gives
+    a palette chosen to represent the things that will actually be painted,
+    instead of one chosen for pixels and then voted on.
+    """
     if k < 2:
         raise ValueError("a paint-by-number page needs at least 2 colours")
-    height, width = lab_image.shape[:2]
-    flat = lab_image.reshape(-1, 3).astype(np.float64, copy=False)
+    flat = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if flat.shape[0] == 0:
+        raise ValueError("nothing to quantize")
 
     rng = np.random.default_rng(seed)
     sample = _subsample(flat, sample_size, rng)
@@ -97,8 +131,55 @@ def quantize(
         block = flat[start : start + _ASSIGN_CHUNK]
         indices[start : start + _ASSIGN_CHUNK] = _assign(block, centroids)
 
-    palette = Palette(lab=centroids, rgb=lab_to_rgb_bytes(centroids))
-    return indices.reshape(height, width), palette
+    return indices, Palette(lab=centroids, rgb=lab_to_rgb_bytes(centroids))
+
+
+def cell_mean_lab(
+    lab_image: np.ndarray, cells: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average colour of every cell, plus how many pixels each holds.
+
+    Averaged in Lab rather than in sRGB. Averaging gamma-encoded sRGB darkens
+    the result wherever a cell straddles an edge, which on a mosaic shows up as
+    a grubby outline shadowing every real contour in the photo.
+
+    Returns arrays indexed by cell id; ids with no pixels are left at zero, and
+    the count array is how the caller tells those apart from genuine black.
+    """
+    flat = cells.ravel()
+    size = int(flat.max()) + 1
+    counts = np.bincount(flat, minlength=size)
+    channels = [
+        np.bincount(flat, weights=lab_image[..., channel].ravel().astype(np.float64), minlength=size)
+        for channel in range(3)
+    ]
+    sums = np.stack(channels, axis=1)
+    means = np.zeros((size, 3), dtype=np.float64)
+    present = counts > 0
+    means[present] = sums[present] / counts[present, None]
+    return means, counts
+
+
+def quantize_cells(
+    lab_image: np.ndarray,
+    cells: np.ndarray,
+    k: int,
+    **kwargs,
+) -> tuple[np.ndarray, np.ndarray, Palette]:
+    """Give every cell of a tiling one paint colour.
+
+    Returns the palette index per cell id, the per-pixel index map, and the
+    palette.
+    """
+    means, counts = cell_mean_lab(lab_image, cells)
+    present = np.flatnonzero(counts)
+    if present.size == 0:
+        raise ValueError("the tiling produced no cells")
+
+    assigned, palette = quantize_points(means[present], k, **kwargs)
+    colour_of_cell = np.zeros(means.shape[0], dtype=np.int16)
+    colour_of_cell[present] = assigned
+    return colour_of_cell, colour_of_cell[cells], palette
 
 
 def _subsample(flat: np.ndarray, sample_size: int, rng: np.random.Generator) -> np.ndarray:
