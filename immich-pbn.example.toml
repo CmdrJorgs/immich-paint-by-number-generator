@@ -1,0 +1,60 @@
+# immich-pbn configuration.
+#
+# Copy to one of these and edit:
+#   ./immich-pbn.toml
+#   ~/.config/immich-pbn/config.toml
+# or point IMMICH_PBN_CONFIG at it.
+#
+# Everything here is optional. With IMMICH_URL and IMMICH_API_KEY in the
+# environment you need no config file at all.
+
+default_server = "home"
+
+# ---------------------------------------------------------------- the LAN box
+[servers.home]
+base_url = "http://immich.local:2283"
+
+# Pick exactly one way to supply the key. api_key_env is the one to use if this
+# file is going anywhere near version control.
+api_key_env = "IMMICH_API_KEY"
+# api_key = "paste-it-here-if-you-must"
+# api_key_file = "~/.config/immich-pbn/api-key"
+
+# "lan" also means environment proxies are ignored for this profile. That is
+# deliberate: an HTTPS_PROXY set for internet traffic will happily swallow a
+# request to `immich.local`, because a hostname never matches the CIDR ranges
+# people put in NO_PROXY. Set use_proxy = true if you actually want it.
+scope = "lan"
+timeout = 30.0
+retries = 3
+
+[servers.home.resolver]
+# system        - let the OS do it (the default, and usually right)
+# static        - a hosts file that lives here instead of in /etc
+# system+static - try the OS, fall back to the entry below
+# dns, mdns     - registered but not implemented; they fail with a note saying so
+kind = "system"
+
+
+# ------------------------------------------------- the same box, from outside
+# Nothing but `--server away` changes at the call site.
+[servers.away]
+base_url = "https://photos.example.com"
+api_key_env = "IMMICH_REMOTE_API_KEY"
+scope = "remote"        # patient timeouts, and environment proxies are honoured
+timeout = 60.0
+verify_tls = true       # or a path to a CA bundle for an internal CA
+# headers = { "CF-Access-Client-Id" = "..." }   # e.g. Cloudflare Access
+
+[servers.away.resolver]
+# The address is pinned, but the Host header and the TLS certificate check both
+# stay on the real name -- so virtual hosts still route and certificates still
+# validate.
+kind = "system+static"
+hosts = { "photos.example.com" = "203.0.113.10" }
+
+
+# ------------------------------------------------------------------- defaults
+# Reserved for per-invocation defaults. The CLI is the source of truth for
+# option names, so nothing is read from here yet.
+[defaults]
