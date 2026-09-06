@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Local config may hold an API key.
+immich-pbn.toml
+.immich-pbn.toml
+
+# Generated pages.
+*.pdf
+*.png
+!docs/*.png
+
+.ruff_cache/
